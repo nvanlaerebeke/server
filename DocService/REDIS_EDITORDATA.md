@@ -1,4 +1,4 @@
-# Redis-backed editorData (save/auth locks + presence)
+# Redis-backed editorData (locks, presence, document data and statistics)
 
 ## Problem
 
@@ -26,13 +26,13 @@ deployment, which is why it's easy to miss.
 
 ## Scope
 
-This module replaces the **save/auth locks** and **presence** portions of
-`editorDataMemory`'s interface with Redis-backed implementations that are
-genuinely shared across replicas. Everything else — block locks, messages,
-save-state, force-save, telemetry — still delegates straight through to
-`editorDataMemory`, unchanged, and is therefore still single-replica-only.
-Extending coverage to those is future work, not something this module
-attempts.
+This module replaces the complete `editorDataMemory` interface with
+Redis-backed implementations that are shared across replicas. Save/auth
+locks fail closed, while presence, document data and statistics fail open to
+the replica-local memory backend when Redis is unavailable. That distinction
+is deliberate: granting a lock without a shared Redis result is unsafe, while
+temporarily losing shared presence, messages or telemetry is preferable to
+making the document service unavailable.
 
 ## Enabling it
 
@@ -99,12 +99,14 @@ surface.
 
 | Deployment                   | Minimum    | What sets the floor                                            |
 | ---------------------------- | ---------- | -------------------------------------------------------------- |
-| Standalone / sentinel        | **2.6.12** | `EVAL`, `PEXPIRE` (2.6.0), `SET … PX` (2.6.12)                |
+| Standalone / sentinel        | **2.6.12** | `EVAL`, `PEXPIRE` (2.6.0), `SET … PX` (2.6.12)                 |
 | Cluster                      | **3.0**    | Cluster mode and hash-tag slot routing did not exist before it |
 | Any deployment naming a user | **6.0**    | Two-argument `AUTH`, i.e. ACLs — see below                     |
 
-The command set is `SET … PX`, `GET`, `DEL`, `HSET`, `HGET`, `HDEL`,
-`HMGET`, `ZADD`, `ZSCORE`, `ZREM`, `ZRANGEBYSCORE … LIMIT`, `PEXPIRE`,
+The command set is `SET … NX EX/PX`, `GET`, `DEL`, `HSET`, `HGET`, `HDEL`,
+`HMGET`, `HGETALL`, `HLEN`, `HEXISTS`, `HINCRBY`, `HVALS`, `RPUSH`,
+`LRANGE`, `ZADD`, `ZSCORE`, `ZREM`, `ZRANGE`, `ZRANGEBYSCORE`,
+`ZREMRANGEBYSCORE`, `SADD`, `SREM`, `SCARD`, `EXPIRE`, `PEXPIRE`, `PTTL`,
 `PING`, plus `EVAL` for the Lua scripts. None of those set a floor above
 2.6.12.
 
@@ -114,10 +116,11 @@ two-argument `AUTH` form when `username` is configured, and two-argument
 form; with fail-closed locks, a password-protected deployment then refuses
 every save until its Redis version or configuration is corrected.
 
-The orchestrated entrypoint used to emit `username: "default"`
-unconditionally, which imposed 6.0 on every deployment. It now emits one
-only when `REDIS_SERVER_USER` is set, so a password-only deployment is back
-to 2.6.12.
+If a Redis username is configured, the orchestrated entrypoint places it in
+`redis.options.user`, and node-redis maps that to `username`. The current
+entrypoint defaults that value to `default`; deployments targeting Redis 5 or
+older must adjust the generated configuration to omit `user` and use
+password-only authentication.
 
 **Raise this deliberately, not by accident.** A single convenient command
 can move the floor a long way — `GETDEL`, the obvious implementation of
@@ -163,12 +166,12 @@ written in response to.
 
 ### Picking the topology: `services.CoAuthoring.redis.mode`
 
-| `mode`           | Client                                                                                                                                                              |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mode`           | Client                                                                                                                  |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------- |
 | `auto` (default) | Cluster when `optionsCluster.rootNodes` is configured; sentinel when a credible sentinel list is; standalone otherwise. |
-| `standalone`     | `redis.createClient({socket: {host, port}, ...options})`, with sentinel-only options stripped. |
-| `sentinel`       | `redis.createSentinel(...)`, honouring `options.sentinels`. Errors if that array is empty. |
-| `cluster`        | `redis.createCluster(...)` over `optionsCluster.rootNodes`. Errors if the list is empty. |
+| `standalone`     | `redis.createClient({socket: {host, port}, ...options})`, with sentinel-only options stripped.                          |
+| `sentinel`       | `redis.createSentinel(...)`, honouring `options.sentinels`. Errors if that array is empty.                              |
+| `cluster`        | `redis.createCluster(...)` over `optionsCluster.rootNodes`. Errors if the list is empty.                                |
 
 Anything else throws at startup and names the valid set. That is
 deliberate: a mode that fell through to standalone turned a typo into
@@ -187,9 +190,11 @@ since sentinels run on their own port, and such a list is still selected.
 Set `mode` explicitly if you would rather not rely on the distinction —
 an explicit mode always wins.
 
-The orchestrated entrypoint states `mode` explicitly, so on a current
-image nothing is being guessed. The detection above is what covers older
-images, which emit the fabricated sentinels and no `mode` at all.
+The orchestrated entrypoint states `mode: "auto"` and writes Sentinel
+settings under `services.CoAuthoring.redis.options`. The client therefore
+uses the same configuration shape for standalone, Sentinel and cluster
+deployments. `iooptions` is no longer consumed; images or local configuration
+still producing it must be updated.
 
 `NODE_CONFIG` is exported by the same entrypoint and outranks every config
 _file_, so on the official image `local.json` cannot override any of this;
@@ -216,21 +221,21 @@ running a build containing it.
 
 ## Architecture
 
-| File                             | Responsibility                                                                                                                                                                                              |
-| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `editorDataRedis.js`             | Composition root: owns the Redis connection and the `editorDataMemory` delegate, wires the two stores below against them, exposes the same `EditorData` interface the rest of the codebase already expects. |
-| `editorDataRedisClient.js`       | Builds the node-redis client for the deployment's topology — standalone, sentinel or cluster — per `services.CoAuthoring.redis.mode`.                                                                          |
-| `editorDataRedisData.js`         | Redis-backed object locks, messages, saved state, force-save state and timers.                                                                                                                                |
-| `editorDataRedisStat.js`         | Redis-backed unique-user, connection, shard, shutdown, licence and notification statistics.                                                                                                                   |
-| `editorDataRedisSaveLock.js`     | `lockSave`/`unlockSave`/`lockAuth`/`unlockAuth`, as atomic Lua scripts.                                                                                                                                     |
-| `editorDataRedisReport.js`       | Throttled failure reporting shared by the stores, so a degraded backend is visible without flooding the log.                                                                                                |
-| `editorDataRedisPresence.js`     | `addPresence`/`updatePresence`/`removePresence`/`getPresence`/`getDocumentPresenceExpired`/`removePresenceDocument`.                                                                                        |
-| `editorDataRedisShardedSweep.js` | A pre-sharded "which (tenant, docId) pairs are due for a sweep" structure, shared by presence's doc-expiry sweep.                                                                                           |
-| `editorDataRedisKeys.js`         | Key/member encoding shared by all of the above.                                                                                                                                                             |
+| File                             | Responsibility                                                                                                                                                                                      |
+| -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `editorDataRedis.js`             | Composition root: owns the Redis connection and memory delegate, wires the locks, presence, data and statistics stores against them, and exposes the existing `EditorData`/`EditorStat` interfaces. |
+| `editorDataRedisClient.js`       | Builds the node-redis client for the deployment's topology — standalone, sentinel or cluster — per `services.CoAuthoring.redis.mode`.                                                               |
+| `editorDataRedisData.js`         | Redis-backed object locks, messages, saved state, force-save state and timers.                                                                                                                      |
+| `editorDataRedisStat.js`         | Redis-backed unique-user, connection, shard, shutdown, licence and notification statistics.                                                                                                         |
+| `editorDataRedisSaveLock.js`     | `lockSave`/`unlockSave`/`lockAuth`/`unlockAuth`, as atomic Lua scripts.                                                                                                                             |
+| `editorDataRedisReport.js`       | Throttled failure reporting shared by the stores, so a degraded backend is visible without flooding the log.                                                                                        |
+| `editorDataRedisPresence.js`     | `addPresence`/`updatePresence`/`removePresence`/`getPresence`/`getDocumentPresenceExpired`/`removePresenceDocument`.                                                                                |
+| `editorDataRedisShardedSweep.js` | A pre-sharded "which (tenant, docId) pairs are due for a sweep" structure, shared by presence's doc-expiry sweep.                                                                                   |
+| `editorDataRedisKeys.js`         | Key/member encoding shared by all of the above.                                                                                                                                                     |
 
-### Fail-closed locks, fail-open presence
+### Fail-closed locks, fail-open data and presence
 
-The two stores deliberately behave opposite ways on a Redis error, because
+The stores deliberately behave differently on a Redis error, because
 the cost of being wrong differs:
 
 - **Locks fail closed.** A Redis error or timeout comes back as a denial
@@ -254,12 +259,17 @@ the cost of being wrong differs:
   applied after the operator's options so a deployment cannot accidentally
   re-enable the replay path for lock operations.
 
-- **Presence fails open.** A Redis error falls back to the memory
+- **Document data and presence fail open.** A Redis error falls back to the memory
   backend's local-connections-only view instead of throwing. The failure
-  mode here is presence being wrong (a joiner waits when it shouldn't, or
-  vice versa) — acceptable as a degrade. Letting the error propagate
-  instead would turn a Redis outage into documents being unopenable, which
-  is a worse failure than stale presence.
+  mode here is a replica-local view of the document state. That can make
+  messages, object locks and force-save state temporarily inconsistent across
+  replicas, but letting the error propagate would turn a Redis outage into
+  document requests failing. The failure is throttled and reported.
+
+- **Statistics fail open.** Statistics use the same memory fallback as the
+  original backend. A Redis statistics failure must not prevent a connection
+  from being added or removed; the affected counters remain local until Redis
+  recovers.
 
 ### What each presence reader does with an unreliable result
 
@@ -343,9 +353,9 @@ rollout can lose a save. Drain rather than rolling-restart if that matters.
 
 ### Reporting failures without drowning in them
 
-Both stores swallow Redis errors by design, and originally none of them
-logged. A deployment that could not reach Redis at all therefore refused
-every save with **nothing whatsoever** in the log.
+The stores swallow Redis errors by design, and originally none of them logged.
+A deployment that could not reach Redis at all therefore refused every save
+with **nothing whatsoever** in the log.
 
 The fix is not an error per catch: a broken deployment fails on every
 operation, hundreds a minute, which hides the signal just as effectively.
@@ -413,9 +423,10 @@ portable to CI). Covered: cross-replica lock/presence discrimination
 against isolated instances, reentrancy and TTL expiry, key-collision
 avoidance, unlock/lockAuth outcomes, HASH/ZSET write atomicity, the sharded
 sweep, fail-closed and fail-open behavior on a simulated Redis error,
-object locks, messages, saved state, force-save state, timers, unique-user
-statistics, connection samples, shard counts, notifications, shutdown and
-licence state. The suite also checks tenant isolation and
+memory fallback for document data and statistics, object locks, messages,
+saved state, force-save state, timers, unique-user statistics, connection
+samples, shard counts, notifications, shutdown and licence state. The suite
+also checks tenant isolation, cleanup ordering and
 `cleanDocumentOnExit` correctly leaving a still-connected viewer's presence
 entry untouched.
 
@@ -423,8 +434,8 @@ entry untouched.
 entrypoint-fabricated `sentinels` array is ignored rather than acted on,
 that an unrecognised mode is refused rather than silently downgraded, that
 cluster root nodes are normalized, that offline queuing cannot be re-enabled
-from operator config, and that cluster credentials land in node-redis' shared
-defaults.
+from operator config, that configured command timeouts reach node-redis, and
+that cluster credentials land in node-redis' shared defaults.
 
 **Independently measured.** A production deployment (2 and 4 docservice
 replicas on Kubernetes, Valkey standalone and in 6-node cluster mode)
@@ -455,9 +466,9 @@ into a committed, CI-runnable integration test is still open.
 
 - Owner-token locks are not fencing tokens (see above) — open, not
   evaluated against the write path.
-- The Redis-backed data and statistics paths are covered at the interface
-  level; document-server end-to-end flows still need a real multi-process
-  integration test.
+- The Redis-backed data and statistics paths have unit coverage, including
+  their memory fallback, but document-server end-to-end flows still need a
+  real multi-process integration test.
 - No committed multi-replica integration test exists; the cross-replica
   claim above has only been verified manually.
 - One question from manual testing was never resolved either way: whether

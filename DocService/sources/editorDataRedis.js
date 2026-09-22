@@ -1,3 +1,28 @@
+/*
+ * (c) Copyright Ascensio System SIA 2010-2024
+ *
+ * This program is a free software product. You can redistribute it and/or
+ * modify it under the terms of the GNU Affero General Public License (AGPL)
+ * version 3 as published by the Free Software Foundation. In accordance with
+ * Section 7(a) of the GNU AGPL its Section 15 shall be amended to the effect
+ * that Ascensio System SIA expressly excludes the warranty of non-infringement
+ * of any third-party rights.
+ *
+ * This program is distributed WITHOUT ANY WARRANTY; without even the implied
+ * warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. For
+ * details, see the GNU AGPL at http://www.gnu.org/licenses/agpl-3.0.html
+ *
+ * The interactive user interfaces in modified source and object code versions
+ * of the Program must display Appropriate Legal Notices, as required under
+ * Section 7 of the GNU AGPL version 3.
+ *
+ * All the Product's GUI elements, including illustrations and icon sets, as
+ * well as technical writing content are licensed under the terms of the
+ * Creative Commons Attribution-ShareAlike 4.0 International. See the License
+ * terms at http://creativecommons.org/licenses/by-sa/4.0/legalcode
+ *
+ */
+
 'use strict';
 
 const config = require('config');
@@ -23,6 +48,10 @@ function installConnectionReporting(client, name) {
   return report;
 }
 
+function reportContext(args) {
+  return args.length > 0 && args[0] && typeof args[0] === 'object' ? args[0] : null;
+}
+
 async function closeClient(client) {
   if (!client || !client.isOpen) {
     return;
@@ -42,6 +71,7 @@ function EditorData() {
   this._memory = new editorDataMemory.EditorData();
   this._redis = createRedisClient(redisConfig());
   installConnectionReporting(this._redis, 'editorDataRedis.connection');
+  this._dataReport = createFailureReporter('editorDataRedisData');
 
   const prefix = redisConfig().prefix || 'ds:';
   this._saveLock = createSaveLockStore(this._redis, prefix);
@@ -121,21 +151,37 @@ for (const method of ROUTES._presence) {
   EditorData.prototype[method] = delegate;
 }
 for (const method of ROUTES._data) {
-  const delegate = function (...args) {
-    return this._data[method](...args);
+  const delegate = async function (...args) {
+    try {
+      const result = await this._data[method](...args);
+      this._dataReport.success(reportContext(args));
+      return result;
+    } catch (error) {
+      this._dataReport.failure(reportContext(args), method, error);
+      return this._memory[method](...args);
+    }
   };
   Object.defineProperty(delegate, 'length', {value: editorDataMemory.EditorData.prototype[method].length});
   EditorData.prototype[method] = delegate;
 }
 
 EditorData.prototype.cleanDocumentOnExit = async function (ctx, docId) {
-  await this._data.cleanDocumentOnExit(ctx, docId);
-  await this._saveLock.cleanup(ctx, docId);
+  try {
+    await this._data.cleanDocumentOnExit(ctx, docId);
+    this._dataReport.success(ctx);
+  } catch (error) {
+    this._dataReport.failure(ctx, 'cleanDocumentOnExit', error);
+    await this._memory.cleanDocumentOnExit(ctx, docId);
+  } finally {
+    await this._saveLock.cleanup(ctx, docId);
+  }
 };
 
 function EditorStat(database) {
+  this._memory = new editorDataMemory.EditorStat();
   this._redis = createRedisClient(redisConfig(), database);
   installConnectionReporting(this._redis, 'editorDataRedisStat.connection');
+  this._statReport = createFailureReporter('editorDataRedisStat');
   this._store = createEditorStatStore(this._redis, redisConfig().prefix || 'ds:');
 }
 
@@ -200,8 +246,15 @@ const STAT_METHODS = {
 };
 
 for (const [method, arity] of Object.entries(STAT_METHODS)) {
-  const delegate = function (...args) {
-    return this._store[method](...args);
+  const delegate = async function (...args) {
+    try {
+      const result = await this._store[method](...args);
+      this._statReport.success(reportContext(args));
+      return result;
+    } catch (error) {
+      this._statReport.failure(reportContext(args), method, error);
+      return this._memory[method](...args);
+    }
   };
   Object.defineProperty(delegate, 'length', {value: arity});
   EditorStat.prototype[method] = delegate;

@@ -290,6 +290,58 @@ describe('editorDataRedis', () => {
       }
     });
 
+    test('continues lock cleanup when Redis data cleanup fails', async () => {
+      const replica = new editorDataRedis.EditorData();
+      await replica.connect();
+      const docId = 'doc-data-cleanup-fail';
+      const originalDataCleanup = replica._data.cleanDocumentOnExit;
+      const memoryCleanup = jest.spyOn(replica._memory, 'cleanDocumentOnExit');
+      const lockCleanup = jest.spyOn(replica._saveLock, 'cleanup').mockResolvedValue();
+      replica._data.cleanDocumentOnExit = async () => {
+        throw new Error('simulated Redis data cleanup error');
+      };
+
+      try {
+        await expect(replica.cleanDocumentOnExit(ctx, docId)).resolves.toBeUndefined();
+        expect(memoryCleanup).toHaveBeenCalledWith(ctx, docId);
+        expect(lockCleanup).toHaveBeenCalledWith(ctx, docId);
+      } finally {
+        replica._data.cleanDocumentOnExit = originalDataCleanup;
+        memoryCleanup.mockRestore();
+        lockCleanup.mockRestore();
+        await replica.close();
+      }
+    });
+
+    test('falls back to the memory data store when Redis data operations fail', async () => {
+      const replica = new editorDataRedis.EditorData();
+      await replica.connect();
+      const docId = 'doc-data-fallback';
+      const originalAddMessage = replica._data.addMessage;
+      const originalGetMessages = replica._data.getMessages;
+      const memoryAddMessage = jest.spyOn(replica._memory, 'addMessage');
+      const memoryGetMessages = jest.spyOn(replica._memory, 'getMessages').mockResolvedValue([{memory: true}]);
+      replica._data.addMessage = async () => {
+        throw new Error('simulated Redis data write error');
+      };
+      replica._data.getMessages = async () => {
+        throw new Error('simulated Redis data read error');
+      };
+
+      try {
+        await expect(replica.addMessage(ctx, docId, {memory: true})).resolves.toBeUndefined();
+        await expect(replica.getMessages(ctx, docId)).resolves.toEqual([{memory: true}]);
+        expect(memoryAddMessage).toHaveBeenCalledWith(ctx, docId, {memory: true});
+        expect(memoryGetMessages).toHaveBeenCalledWith(ctx, docId);
+      } finally {
+        replica._data.addMessage = originalAddMessage;
+        replica._data.getMessages = originalGetMessages;
+        memoryAddMessage.mockRestore();
+        memoryGetMessages.mockRestore();
+        await replica.close();
+      }
+    });
+
     // Regression for isConnected()/healthCheck() being unable to ever turn
     // true on an idle replica when no Redis command has touched the client.
     test('isConnected()/healthCheck() become true after connect(), with no lock/presence traffic', async () => {
@@ -389,7 +441,7 @@ describe('editorDataRedis', () => {
             expect(editorDataRedis.EditorData.prototype[method]).toHaveLength(interfaceArity(method));
             const args = Array.from({length: interfaceArity(method)}, (_, i) => `arg${i}`);
             const target = jest.spyOn(instance[store], method).mockReturnValue('routed');
-            expect(instance[method](...args)).toBe('routed');
+            expect(await instance[method](...args)).toBe('routed');
             expect(target).toHaveBeenCalledWith(...args);
             target.mockRestore();
           }

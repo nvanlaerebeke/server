@@ -1,3 +1,28 @@
+/*
+ * (c) Copyright Ascensio System SIA 2010-2024
+ *
+ * This program is a free software product. You can redistribute it and/or
+ * modify it under the terms of the GNU Affero General Public License (AGPL)
+ * version 3 as published by the Free Software Foundation. In accordance with
+ * Section 7(a) of the GNU AGPL its Section 15 shall be amended to the effect
+ * that Ascensio System SIA expressly excludes the warranty of non-infringement
+ * of any third-party rights.
+ *
+ * This program is distributed WITHOUT ANY WARRANTY; without even the implied
+ * warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. For
+ * details, see the GNU AGPL at http://www.gnu.org/licenses/agpl-3.0.html
+ *
+ * The interactive user interfaces in modified source and object code versions
+ * of the Program must display Appropriate Legal Notices, as required under
+ * Section 7 of the GNU AGPL version 3.
+ *
+ * All the Product's GUI elements, including illustrations and icon sets, as
+ * well as technical writing content are licensed under the terms of the
+ * Creative Commons Attribution-ShareAlike 4.0 International. See the License
+ * terms at http://creativecommons.org/licenses/by-sa/4.0/legalcode
+ *
+ */
+
 'use strict';
 
 const redis = require('redis');
@@ -19,6 +44,11 @@ function nodeOptions(redisCfg, source, database) {
   if (options.user !== undefined && options.username === undefined) {
     options.username = options.user;
   }
+  delete options.user;
+  delete options.sentinels;
+  delete options.name;
+  delete options.sentinelUsername;
+  delete options.sentinelPassword;
   options.disableOfflineQueue = true;
   if (options.db !== undefined && options.database === undefined) {
     options.database = options.db;
@@ -32,6 +62,17 @@ function nodeOptions(redisCfg, source, database) {
       host: options.socket?.host || redisCfg.host,
       port: Number(options.socket?.port || redisCfg.port)
     });
+  }
+  return options;
+}
+
+function sentinelNodeOptions(redisCfg, source, database) {
+  const options = nodeOptions(redisCfg, source, database);
+  if (source.sentinelUsername !== undefined) {
+    options.username = source.sentinelUsername;
+  }
+  if (source.sentinelPassword !== undefined) {
+    options.password = source.sentinelPassword;
   }
   return options;
 }
@@ -96,9 +137,12 @@ function firstKey(args) {
   return args[1];
 }
 
-function sendCommand(client, args, timeout = DEFAULT_COMMAND_TIMEOUT) {
+function sendCommand(client, args, timeout) {
+  const configuredTimeout = timeout === undefined ? client.__editorDataCommandTimeout : timeout;
+  const commandTimeout = Number(configuredTimeout);
+  const effectiveTimeout = Number.isFinite(commandTimeout) && commandTimeout > 0 ? commandTimeout : DEFAULT_COMMAND_TIMEOUT;
   const normalized = args.map(value => String(value));
-  const commandOptions = {timeout};
+  const commandOptions = {timeout: effectiveTimeout};
   let promise;
   switch (topology(client)) {
     case 'cluster':
@@ -111,7 +155,7 @@ function sendCommand(client, args, timeout = DEFAULT_COMMAND_TIMEOUT) {
       promise = client.sendCommand(normalized, commandOptions);
       break;
   }
-  return withTimeout(promise, timeout, `Redis ${normalized[0] || 'command'}`);
+  return withTimeout(promise, effectiveTimeout, `Redis ${normalized[0] || 'command'}`);
 }
 
 function defineScript(client, name, script, numberOfKeys) {
@@ -169,12 +213,13 @@ function createRedisClient(redisCfg, database) {
     });
     clientTopology = 'cluster';
   } else if (mode === 'sentinel' || (mode === 'auto' && sentinels.length > 0 && !fabricatedSentinel(redisCfg, sentinelNodes(sentinels)))) {
-    const sentinelOptions = nodeOptions(redisCfg, options, database);
+    const masterOptions = nodeOptions(redisCfg, options, database);
+    const sentinelOptions = sentinelNodeOptions(redisCfg, options, database);
     const sentinelName = options.name || redisCfg.sentinelName || 'mymaster';
     client = redis.createSentinel({
       name: sentinelName,
       sentinelRootNodes: sentinelNodes(sentinels),
-      nodeClientOptions: sentinelOptions,
+      nodeClientOptions: masterOptions,
       sentinelClientOptions: sentinelOptions,
       passthroughClientErrorEvents: true
     });

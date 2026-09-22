@@ -1,4 +1,4 @@
-const {describe, test, expect, beforeAll, afterAll} = require('@jest/globals');
+const {describe, test, expect, beforeAll, afterAll, jest} = require('@jest/globals');
 const path = require('path');
 const {RedisMemoryServer} = require('../../DocService/node_modules/redis-memory-server');
 
@@ -130,6 +130,23 @@ describe('editorDataRedis statistics contract', () => {
       expect(await stats[0].getLicense(licenseKey)).toBe('license-value');
     } finally {
       await proxy.close();
+    }
+  });
+
+  test('falls back to the memory statistics store when Redis statistics fail', async () => {
+    const stat = stats[0];
+    const original = stat._store.setEditorConnections;
+    const fallback = jest.spyOn(stat._memory, 'setEditorConnections');
+    stat._store.setEditorConnections = async () => {
+      throw new Error('simulated Redis statistics error');
+    };
+
+    try {
+      await expect(stat.setEditorConnections(context, 1, 2, 3, Date.now(), [{val: 1000}])).resolves.toBeUndefined();
+      expect(fallback).toHaveBeenCalledWith(context, 1, 2, 3, expect.any(Number), [{val: 1000}]);
+    } finally {
+      stat._store.setEditorConnections = original;
+      fallback.mockRestore();
     }
   });
 });

@@ -33,6 +33,21 @@ describe('editorDataRedisClient', () => {
     }
   });
 
+  test('uses the configured command timeout when a call does not override it', async () => {
+    const calls = [];
+    const client = {
+      __editorDataTopology: 'standalone',
+      __editorDataCommandTimeout: 1000,
+      sendCommand(args, options) {
+        calls.push([args, options]);
+        return Promise.resolve('OK');
+      }
+    };
+
+    await expect(sendCommand(client, ['PING'])).resolves.toBe('OK');
+    expect(calls).toEqual([[['PING'], {timeout: 1000}]]);
+  });
+
   test('selects sentinel mode only for an explicit or credible sentinel configuration', () => {
     const fabricated = createRedisClient(standaloneCfg({options: {sentinels: [{host: '127.0.0.1', port: 6379}], name: 'mymaster'}}));
     const credible = createRedisClient(
@@ -53,6 +68,8 @@ describe('editorDataRedisClient', () => {
       expect(fabricated.__editorDataTopology).toBe('standalone');
       expect(credible.__editorDataTopology).toBe('sentinel');
       expect(explicit.__editorDataTopology).toBe('sentinel');
+      expect(credible.__editorDataOptions).not.toHaveProperty('sentinels');
+      expect(credible.__editorDataOptions).not.toHaveProperty('sentinelPassword');
     } finally {
       close(fabricated);
       close(credible);
