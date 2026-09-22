@@ -2,6 +2,7 @@
 
 const {buildKey} = require('./editorDataRedisKeys');
 const {createFailureReporter} = require('./editorDataRedisReport');
+const {defineScript, sendCommand} = require('./editorDataRedisClient');
 
 // Owner-token locks, not fencing tokens - see REDIS_EDITORDATA.md.
 
@@ -37,8 +38,8 @@ function ttlToMs(ttl) {
 
 // Caller owns the client's lifetime.
 function createSaveLockStore(redis, prefix) {
-  redis.defineCommand('saveLockScript', {numberOfKeys: 1, lua: LOCK_SCRIPT});
-  redis.defineCommand('saveUnlockScript', {numberOfKeys: 1, lua: UNLOCK_SCRIPT});
+  defineScript(redis, 'saveLockScript', LOCK_SCRIPT, 1);
+  defineScript(redis, 'saveUnlockScript', UNLOCK_SCRIPT, 1);
 
   const report = createFailureReporter('editorDataRedisSaveLock');
 
@@ -64,7 +65,8 @@ function createSaveLockStore(redis, prefix) {
   async function unlock(keyPrefix, ctx, docId, userId) {
     try {
       const key = buildKey(keyPrefix, ctx.tenant, docId);
-      const [code] = await redis.saveUnlockScript(key, userId);
+      const reply = await redis.saveUnlockScript(key, userId);
+      const [code] = Array.isArray(reply) ? reply : [reply];
       report.success(ctx);
       if (code === 1) return UNLOCK_RES.UNLOCKED;
       if (code === 0) return UNLOCK_RES.LOCKED;
@@ -85,7 +87,7 @@ function createSaveLockStore(redis, prefix) {
       // only delays removal. Throwing here would abort the caller's remaining
       // cleanup (e.g. unlockWopiDoc) on a transient blip.
       try {
-        await redis.del(buildKey(lockSavePrefix, ctx.tenant, docId), buildKey(lockAuthPrefix, ctx.tenant, docId));
+        await sendCommand(redis, ['DEL', buildKey(lockSavePrefix, ctx.tenant, docId), buildKey(lockAuthPrefix, ctx.tenant, docId)]);
         report.success(ctx);
       } catch (err) {
         report.failure(ctx, 'cleanup', err);

@@ -3,6 +3,7 @@
 const {buildKey} = require('./editorDataRedisKeys');
 const {createShardedSweep} = require('./editorDataRedisShardedSweep');
 const {createFailureReporter} = require('./editorDataRedisReport');
+const {defineScript, sendCommand} = require('./editorDataRedisClient');
 
 // A HASH per document for connection info, a companion SORTED SET for
 // per-connection expiry, and a sharded sweep of documents with no live
@@ -66,9 +67,9 @@ const NATIVE_TTL_MULTIPLIER = 3;
 // `ttlSeconds`: services.CoAuthoring.expire.presence. `memoryFallback`: an
 // editorDataMemory.EditorData, reused for the fail-open degrade path.
 function createPresenceStore(redis, prefix, ttlSeconds, memoryFallback) {
-  redis.defineCommand('presenceWriteScript', {numberOfKeys: 2, lua: WRITE_SCRIPT});
-  redis.defineCommand('presenceRemoveScript', {numberOfKeys: 2, lua: REMOVE_SCRIPT});
-  redis.defineCommand('presenceRefreshScript', {numberOfKeys: 2, lua: REFRESH_SCRIPT});
+  defineScript(redis, 'presenceWriteScript', WRITE_SCRIPT, 2);
+  defineScript(redis, 'presenceRemoveScript', REMOVE_SCRIPT, 2);
+  defineScript(redis, 'presenceRefreshScript', REFRESH_SCRIPT, 2);
 
   const report = createFailureReporter('editorDataRedisPresence');
   // The doc-expiry sweep gets its own reporter. Sharing one made the throttle
@@ -175,11 +176,11 @@ function createPresenceStore(redis, prefix, ttlSeconds, memoryFallback) {
           const expKey = buildKey(presenceExpPrefix, ctx.tenant, docId);
           const hashKey = buildKey(presencePrefix, ctx.tenant, docId);
           const now = Date.now();
-          const liveIds = await redis.zrangebyscore(expKey, now, '+inf');
+          const liveIds = await sendCommand(redis, ['ZRANGEBYSCORE', expKey, now, '+inf']);
           if (0 === liveIds.length) {
             return [];
           }
-          const values = await redis.hmget(hashKey, ...liveIds);
+          const values = await sendCommand(redis, ['HMGET', hashKey, ...liveIds]);
           return values.filter(v => null != v);
         },
         async () => {
@@ -210,7 +211,7 @@ function createPresenceStore(redis, prefix, ttlSeconds, memoryFallback) {
         async () => {
           const hashKey = buildKey(presencePrefix, ctx.tenant, docId);
           const expKey = buildKey(presenceExpPrefix, ctx.tenant, docId);
-          await redis.del(hashKey, expKey);
+          await sendCommand(redis, ['DEL', hashKey, expKey]);
           await docExpSweep.untrack(ctx.tenant, docId);
         },
         () => memoryFallback.removePresenceDocument(ctx, docId)

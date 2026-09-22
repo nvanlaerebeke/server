@@ -1,205 +1,216 @@
 'use strict';
-const config = require('config');
-const Redis = require('ioredis');
-const {createRedisClient} = require('./editorDataRedisClient');
-const editorDataMemory = require('./editorDataMemory');
-const {createSaveLockStore} = require('./editorDataRedisSaveLock');
-const {createPresenceStore} = require('./editorDataRedisPresence');
-const {createFailureReporter} = require('./editorDataRedisReport');
 
-// Composition root for the Redis-backed save/auth locks and presence: owns
-// the connection and the memory-backend delegate, wires the two stores
-// against them. Everything not ported still delegates to editorDataMemory.
-// See REDIS_EDITORDATA.md.
+const config = require('config');
+const editorDataMemory = require('./editorDataMemory');
+const {createRedisClient, connectRedisClient, sendCommand, withTimeout} = require('./editorDataRedisClient');
+const {createFailureReporter} = require('./editorDataRedisReport');
+const {createPresenceStore} = require('./editorDataRedisPresence');
+const {createSaveLockStore} = require('./editorDataRedisSaveLock');
+const {createEditorDataStore} = require('./editorDataRedisData');
+const {createEditorStatStore} = require('./editorDataRedisStat');
+
+const CONNECT_TIMEOUT = 3000;
+
+function redisConfig() {
+  return config.get('services.CoAuthoring.redis');
+}
+
+function installConnectionReporting(client, name) {
+  const report = createFailureReporter(name);
+  client.on('error', error => report.failure(null, 'connection', error));
+  client.on('ready', () => report.success(null));
+  client.on('reconnecting', details => report.failure(null, 'reconnect', details || new Error('Redis reconnecting')));
+  return report;
+}
+
+async function closeClient(client) {
+  if (!client || !client.isOpen) {
+    return;
+  }
+  try {
+    await withTimeout(client.quit(), 5000, 'Redis quit');
+  } catch {
+    if (typeof client.destroy === 'function') {
+      client.destroy();
+    } else if (typeof client.disconnect === 'function') {
+      client.disconnect();
+    }
+  }
+}
 
 function EditorData() {
   this._memory = new editorDataMemory.EditorData();
+  this._redis = createRedisClient(redisConfig());
+  installConnectionReporting(this._redis, 'editorDataRedis.connection');
 
-  const redisCfg = config.get('services.CoAuthoring.redis');
-  const prefix = redisCfg.prefix || 'ds:';
-
-  // Standalone, sentinel or cluster, per services.CoAuthoring.redis.mode.
-  // ioredis overrides live under `iooptions`; the sibling `options` block is
-  // the legacy node-redis one and does nothing here.
-  this._redis = createRedisClient(redisCfg);
-
-  // Connection errors never reach the stores' catch blocks - ioredis emits
-  // them as 'error' events - and with no listener it prints
-  // "[ioredis] Unhandled error event" plus a stack straight to stderr, once
-  // per retry, for the length of an outage. That bypasses both the logger
-  // and the throttle the stores use. Route them through the same reporter.
-  this._connectionReport = createFailureReporter('editorDataRedis.connection');
-  this._redis.on('error', err => this._connectionReport.failure(null, 'connection', err));
-  this._redis.on('ready', () => this._connectionReport.success(null));
-  // A cluster raises 'error' only when every node has failed; a single
-  // unreachable master arrives as 'node error'. Without this, the topology
-  // where one node is down - fail-closed for every document on its slots -
-  // produces no line naming the cause at all.
-  if (this._redis instanceof Redis.Cluster) {
-    this._redis.on('node error', err => this._connectionReport.failure(null, 'node connection', err));
-  }
-
+  const prefix = redisConfig().prefix || 'ds:';
   this._saveLock = createSaveLockStore(this._redis, prefix);
-  this._presence = createPresenceStore(this._redis, prefix, config.get('services.CoAuthoring.expire.presence'), this._memory);
+  this._presence = createPresenceStore(this._redis, prefix, Number(config.get('services.CoAuthoring.expire.presence')), this._memory);
+  this._data = createEditorDataStore(this._redis, prefix);
 }
-
-// Long enough for a healthy Redis on the same network, short enough that a
-// dead one does not hold up the startup chain behind it.
-const CONNECT_TIMEOUT_MS = 3000;
 
 EditorData.prototype.connect = async function () {
   await this._memory.connect();
-  // `iooptions.lazyConnect: true` is the shipped default, which parks the
-  // client at status "wait" until some real command arrives - so
-  // isConnected()/healthCheck() would never turn true on an idle replica.
-  //
-  // Awaited, because the offline queue is disabled: commands issued before
-  // the client is ready are rejected outright rather than held, so handing
-  // control back while still connecting would deny the first locks of a
-  // freshly started replica. Bounded and swallowed, because Redis being
-  // down at startup must not stop the process booting - it must fail
-  // closed, which it does.
-  // 'end' is a closed client: no 'ready' is coming, so waiting for one just
-  // burns the timeout.
-  if (this._redis.status === 'ready' || this._redis.status === 'end') {
-    return;
-  }
-
-  // "not ready", not "at wait": with lazyConnect off the constructor has
-  // already started connecting, and returning here would hand back a client
-  // whose first commands are still rejected.
-  let timer;
-  let onReady;
-  const ready = new Promise(resolve => {
-    onReady = resolve;
-    this._redis.once('ready', onReady);
-  });
   try {
-    // connect() rejects unless the client is parked, and rejects on the
-    // first failed attempt - so a refused connection returns straight away
-    // and the timer only covers a connect that hangs.
-    const racers = [
-      ready,
-      new Promise(resolve => {
-        timer = setTimeout(resolve, CONNECT_TIMEOUT_MS);
-      })
-    ];
-    if (this._redis.status === 'wait') {
-      racers.push(this._redis.connect().catch(() => {}));
-    }
-    await Promise.race(racers);
-  } finally {
-    clearTimeout(timer);
-    this._redis.removeListener('ready', onReady);
+    await withTimeout(connectRedisClient(this._redis), CONNECT_TIMEOUT, 'Redis connect');
+  } catch (error) {
+    this._connectionError = error;
   }
 };
 EditorData.prototype.isConnected = function () {
-  return this._redis.status === 'ready' && this._memory.isConnected();
+  return Boolean(this._redis.isReady) && this._memory.isConnected();
 };
 EditorData.prototype.ping = async function () {
-  return this._redis.ping();
+  await connectRedisClient(this._redis);
+  return sendCommand(this._redis, ['PING']);
 };
 EditorData.prototype.close = async function () {
-  // QUIT is itself a command, so with the offline queue disabled it is
-  // rejected on a client that never reached a server. Closing must not
-  // depend on the connection having worked.
-  try {
-    await this._redis.quit();
-  } catch {
-    this._redis.disconnect();
-  }
+  await closeClient(this._redis);
   await this._memory.close();
 };
 EditorData.prototype.healthCheck = async function () {
-  if (this.isConnected()) {
+  if (!this.isConnected()) {
+    return false;
+  }
+  try {
     await this.ping();
     return true;
+  } catch {
+    return false;
   }
-  return false;
 };
 
-// Which store backs each implemented method. Declared as well as defined
-// below, because the two answer different questions: the definitions carry
-// the signatures a maintainer navigates to, this carries the shape a reviewer
-// wants at a glance. A test proves they agree.
 const ROUTES = {
   _saveLock: ['lockSave', 'unlockSave', 'lockAuth', 'unlockAuth'],
-  _presence: ['addPresence', 'updatePresence', 'removePresence', 'getPresence', 'getDocumentPresenceExpired', 'removePresenceDocument']
+  _presence: ['addPresence', 'updatePresence', 'removePresence', 'getPresence', 'getDocumentPresenceExpired', 'removePresenceDocument'],
+  _data: [
+    'addLocks',
+    'addLocksNX',
+    'removeLocks',
+    'removeAllLocks',
+    'getLocks',
+    'addMessage',
+    'removeMessages',
+    'getMessages',
+    'setSaved',
+    'getdelSaved',
+    'setForceSave',
+    'getForceSave',
+    'checkAndStartForceSave',
+    'checkAndSetForceSave',
+    'removeForceSave',
+    'addForceSaveTimerNX',
+    'getForceSaveTimer'
+  ]
 };
 
-EditorData.prototype.lockSave = function (ctx, docId, userId, ttl) {
-  return this._saveLock.lockSave(ctx, docId, userId, ttl);
-};
-EditorData.prototype.unlockSave = function (ctx, docId, userId) {
-  return this._saveLock.unlockSave(ctx, docId, userId);
-};
-EditorData.prototype.lockAuth = function (ctx, docId, userId, ttl) {
-  return this._saveLock.lockAuth(ctx, docId, userId, ttl);
-};
-EditorData.prototype.unlockAuth = function (ctx, docId, userId) {
-  return this._saveLock.unlockAuth(ctx, docId, userId);
-};
+const EXPLICIT = ['cleanDocumentOnExit'];
 
-EditorData.prototype.addPresence = function (ctx, docId, userId, userInfo) {
-  return this._presence.addPresence(ctx, docId, userId, userInfo);
-};
-EditorData.prototype.updatePresence = function (ctx, docId, userId) {
-  return this._presence.updatePresence(ctx, docId, userId);
-};
-EditorData.prototype.removePresence = function (ctx, docId, userId) {
-  return this._presence.removePresence(ctx, docId, userId);
-};
-EditorData.prototype.getPresence = function (ctx, docId, connections) {
-  return this._presence.getPresence(ctx, docId, connections);
-};
-EditorData.prototype.getDocumentPresenceExpired = function (now) {
-  return this._presence.getDocumentPresenceExpired(now);
-};
-EditorData.prototype.removePresenceDocument = function (ctx, docId) {
-  return this._presence.removePresenceDocument(ctx, docId);
-};
-
-// Not ported: still per-replica, with every consequence that implies. A list
-// rather than seventeen bodies - `...args` cannot drop a parameter, which
-// hand-writing them can, and this shrinks visibly as groups land.
-const NOT_PORTED = [
-  'addLocks',
-  'addLocksNX',
-  'removeLocks',
-  'removeAllLocks',
-  'getLocks',
-  'addMessage',
-  'removeMessages',
-  'getMessages',
-  'setSaved',
-  'getdelSaved',
-  'setForceSave',
-  'getForceSave',
-  'checkAndStartForceSave',
-  'checkAndSetForceSave',
-  'removeForceSave',
-  'addForceSaveTimerNX',
-  'getForceSaveTimer'
-];
-for (const method of NOT_PORTED) {
-  EditorData.prototype[method] = function (...args) {
-    return this._memory[method](...args);
+for (const method of ROUTES._saveLock) {
+  const delegate = function (...args) {
+    return this._saveLock[method](...args);
   };
+  Object.defineProperty(delegate, 'length', {value: editorDataMemory.EditorData.prototype[method].length});
+  EditorData.prototype[method] = delegate;
+}
+for (const method of ROUTES._presence) {
+  const delegate = function (...args) {
+    return this._presence[method](...args);
+  };
+  Object.defineProperty(delegate, 'length', {value: editorDataMemory.EditorData.prototype[method].length});
+  EditorData.prototype[method] = delegate;
+}
+for (const method of ROUTES._data) {
+  const delegate = function (...args) {
+    return this._data[method](...args);
+  };
+  Object.defineProperty(delegate, 'length', {value: editorDataMemory.EditorData.prototype[method].length});
+  EditorData.prototype[method] = delegate;
 }
 
-// Deliberately does not touch presence: this fires once `!hasEditors`, which
-// ignores viewers, so a viewer may still be connected. The "presence is
-// genuinely empty" cleanup is a separate call site.
 EditorData.prototype.cleanDocumentOnExit = async function (ctx, docId) {
-  await this._memory.cleanDocumentOnExit(ctx, docId);
+  await this._data.cleanDocumentOnExit(ctx, docId);
   await this._saveLock.cleanup(ctx, docId);
 };
 
+function EditorStat(database) {
+  this._redis = createRedisClient(redisConfig(), database);
+  installConnectionReporting(this._redis, 'editorDataRedisStat.connection');
+  this._store = createEditorStatStore(this._redis, redisConfig().prefix || 'ds:');
+}
+
+EditorStat.prototype.connect = async function () {
+  try {
+    await withTimeout(connectRedisClient(this._redis), CONNECT_TIMEOUT, 'Redis connect');
+  } catch (error) {
+    this._connectionError = error;
+  }
+};
+EditorStat.prototype.isConnected = function () {
+  return Boolean(this._redis.isReady);
+};
+EditorStat.prototype.ping = async function () {
+  await connectRedisClient(this._redis);
+  return sendCommand(this._redis, ['PING']);
+};
+EditorStat.prototype.close = function () {
+  return closeClient(this._redis);
+};
+EditorStat.prototype.healthCheck = async function () {
+  if (!this.isConnected()) {
+    return false;
+  }
+  try {
+    await this.ping();
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const STAT_METHODS = {
+  addPresenceUniqueUser: 4,
+  getPresenceUniqueUser: 2,
+  addPresenceUniqueViewUser: 4,
+  getPresenceUniqueViewUser: 2,
+  addPresenceUniqueUsersOfMonth: 4,
+  getPresenceUniqueUsersOfMonth: 1,
+  addPresenceUniqueViewUsersOfMonth: 4,
+  getPresenceUniqueViewUsersOfMonth: 1,
+  setEditorConnections: 6,
+  getEditorConnections: 1,
+  setEditorConnectionsCountByShard: 3,
+  incrEditorConnectionsCountByShard: 3,
+  getEditorConnectionsCount: 2,
+  setViewerConnectionsCountByShard: 3,
+  incrViewerConnectionsCountByShard: 3,
+  getViewerConnectionsCount: 2,
+  setLiveViewerConnectionsCountByShard: 3,
+  incrLiveViewerConnectionsCountByShard: 3,
+  getLiveViewerConnectionsCount: 2,
+  addShutdown: 2,
+  removeShutdown: 2,
+  getShutdownCount: 1,
+  cleanupShutdown: 1,
+  setLicense: 2,
+  getLicense: 1,
+  removeLicense: 1,
+  lockNotification: 3,
+  deleteKey: 1
+};
+
+for (const [method, arity] of Object.entries(STAT_METHODS)) {
+  const delegate = function (...args) {
+    return this._store[method](...args);
+  };
+  Object.defineProperty(delegate, 'length', {value: arity});
+  EditorStat.prototype[method] = delegate;
+}
+
 module.exports = {
   EditorData,
-  // Reused unchanged - editorStatStorage falls back to this module when unset.
-  EditorStat: editorDataMemory.EditorStat,
-  // Exported for the completeness tests, not for callers.
-  ROUTES,
-  NOT_PORTED
+  EditorStat,
+  EXPLICIT,
+  NOT_PORTED: [],
+  ROUTES
 };

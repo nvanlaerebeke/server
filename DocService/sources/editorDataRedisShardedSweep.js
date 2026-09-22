@@ -1,6 +1,7 @@
 'use strict';
 
 const {encodePair, decodePair, shardIndex} = require('./editorDataRedisKeys');
+const {defineScript, sendCommand} = require('./editorDataRedisClient');
 
 // "Which (tenant, docId) pairs are due for a sweep", spread over N sorted
 // sets. See REDIS_EDITORDATA.md for why it's sharded.
@@ -29,12 +30,12 @@ return 1
 const CLAIM_BATCH_SIZE = 100;
 
 // `commandNamePrefix` must be unique per sweep instance sharing one client -
-// ioredis registers defined commands by name on the client itself.
+// script helpers are attached to the client by name.
 function createShardedSweep(redis, keyPrefix, numShards, commandNamePrefix) {
   const claimCommand = `${commandNamePrefix}Claim`;
   const trackCommand = `${commandNamePrefix}Track`;
-  redis.defineCommand(claimCommand, {numberOfKeys: 1, lua: CLAIM_SCRIPT});
-  redis.defineCommand(trackCommand, {numberOfKeys: 1, lua: TRACK_SCRIPT});
+  defineScript(redis, claimCommand, CLAIM_SCRIPT, 1);
+  defineScript(redis, trackCommand, TRACK_SCRIPT, 1);
 
   function shardKey(tenant, docId) {
     return `${keyPrefix}${shardIndex(tenant, docId, numShards)}`;
@@ -51,7 +52,7 @@ function createShardedSweep(redis, keyPrefix, numShards, commandNamePrefix) {
     async untrack(tenant, docId) {
       const key = shardKey(tenant, docId);
       const member = encodePair(tenant, docId);
-      await redis.zrem(key, member);
+      await sendCommand(redis, ['ZREM', key, member]);
     },
     // [tenant, docId] pairs due at `now`.
     async claimExpired(now) {

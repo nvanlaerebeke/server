@@ -3,8 +3,20 @@ const path = require('path');
 // Only installed under DocService/node_modules, not at this level - same
 // explicit-path convention tests/integration uses for Common-only packages.
 const {RedisMemoryServer} = require('../../DocService/node_modules/redis-memory-server');
-const Redis = require('../../DocService/node_modules/ioredis');
+const redis = require('../../DocService/node_modules/redis');
 const {buildKey} = require('../../DocService/sources/editorDataRedisKeys');
+
+async function createRawRedis(options) {
+  const client = redis.createClient({socket: options});
+  await client.connect();
+  client.hexists = (key, field) => client.hExists(key, field);
+  client.zscore = (key, member) => client.zScore(key, member);
+  client.zadd = (key, score, member) => client.zAdd(key, {score: Number(score), value: member});
+  client.zcard = key => client.zCard(key);
+  client.hlen = key => client.hLen(key);
+  client.hget = (key, field) => client.hGet(key, field);
+  return client;
+}
 
 // A joiner on a DIFFERENT replica correctly seeing an existing editor is the
 // thing editorDataMemory structurally cannot do - each replica's own
@@ -21,9 +33,14 @@ describe('editorDataRedis presence', () => {
   const ctx = {tenant: 'localhost'};
 
   beforeAll(async () => {
-    redisServer = new RedisMemoryServer();
-    host = await redisServer.getHost();
-    port = await redisServer.getPort();
+    if (process.env.TEST_REDIS_HOST) {
+      host = process.env.TEST_REDIS_HOST;
+      port = Number(process.env.TEST_REDIS_PORT || 6379);
+    } else {
+      redisServer = new RedisMemoryServer();
+      host = await redisServer.getHost();
+      port = await redisServer.getPort();
+    }
 
     process.env.NODE_CONFIG_DIR = process.env.EO_CONFIG_DIR || path.join(__dirname, '..', '..', 'Common', 'config');
     process.env.NODE_CONFIG = JSON.stringify({
@@ -41,7 +58,9 @@ describe('editorDataRedis presence', () => {
   }, 30000);
 
   afterAll(async () => {
-    await redisServer.stop();
+    if (redisServer) {
+      await redisServer.stop();
+    }
   });
 
   test('a joiner on a different replica sees the existing editor', async () => {
@@ -76,7 +95,7 @@ describe('editorDataRedis presence', () => {
   // separate connection from the one doing the writes.
   test('write and remove never leave the HASH and ZSET disagreeing, across many rounds', async () => {
     const writer = new editorDataRedis.EditorData();
-    const raw = new Redis({host, port});
+    const raw = await createRawRedis({host, port});
     await writer.connect();
     const docId = 'doc-atomicity';
     const hashKey = buildKey('presence-test:presence:', ctx.tenant, docId);
@@ -117,7 +136,7 @@ describe('editorDataRedis presence', () => {
   // machinery in the way.
   describe('presence store internals (short TTL, direct construction)', () => {
     test('expiry-driven disappearance and explicit removal', async () => {
-      const redisClient = new Redis({host, port});
+      const redisClient = await createRawRedis({host, port});
       const store = createPresenceStore(redisClient, 'presence-test-3:', 1, new editorDataMemory.EditorData());
       const docId = 'doc-expiry';
 
@@ -141,7 +160,7 @@ describe('editorDataRedis presence', () => {
     }, 10000);
 
     test('getDocumentPresenceExpired sharded sweep finds all due documents once and does not re-claim them', async () => {
-      const redisClient = new Redis({host, port});
+      const redisClient = await createRawRedis({host, port});
       const store = createPresenceStore(redisClient, 'presence-test-4:', 1, new editorDataMemory.EditorData());
       const docIds = ['doc-sweep-1', 'doc-sweep-2', 'doc-sweep-3', 'doc-sweep-4', 'doc-sweep-5'];
 
@@ -172,7 +191,7 @@ describe('editorDataRedis presence', () => {
     // now genuinely disappear between heartbeats, not just via explicit
     // removal.
     test('updatePresence reports false when there is nothing to refresh, true when there is', async () => {
-      const redisClient = new Redis({host, port});
+      const redisClient = await createRawRedis({host, port});
       const store = createPresenceStore(redisClient, 'presence-test-5:', 1, new editorDataMemory.EditorData());
       const docId = 'doc-update-missing';
 
@@ -206,7 +225,7 @@ describe('editorDataRedis presence', () => {
     const docId = 'doc-prune';
     const hashKey = buildKey('presence-test:presence:', ctx.tenant, docId);
     const expKey = buildKey('presence-test:presenceExp:', ctx.tenant, docId);
-    const raw = new Redis({host, port});
+    const raw = await createRawRedis({host, port});
 
     try {
       await instance.addPresence(ctx, docId, 'uid-live', JSON.stringify({id: 'uid-live'}));
@@ -241,7 +260,7 @@ describe('editorDataRedis presence', () => {
     const docId = 'doc-prune-self';
     const hashKey = buildKey('presence-test:presence:', ctx.tenant, docId);
     const expKey = buildKey('presence-test:presenceExp:', ctx.tenant, docId);
-    const raw = new Redis({host, port});
+    const raw = await createRawRedis({host, port});
 
     try {
       await instance.addPresence(ctx, docId, 'uid-self', JSON.stringify({id: 'uid-self'}));
@@ -259,15 +278,18 @@ describe('editorDataRedis presence', () => {
   }, 10000);
 
   // Simulated deterministically by making the Redis call itself throw,
-  // rather than racing a real broken TCP connection against ioredis's async
+  // rather than racing a real broken TCP connection against Redis's async
   // connect/retry machinery (flaky, and not what this test is about - it's
   // about the catch branch in getPresence, not connection timing).
   test('getPresence fails open (falls back to the memory backend) when Redis errors', async () => {
     const instance = new editorDataRedis.EditorData();
     await instance.connect();
-    const originalZrangebyscore = instance._redis.zrangebyscore.bind(instance._redis);
-    instance._redis.zrangebyscore = async () => {
-      throw new Error('simulated Redis error');
+    const originalSendCommand = instance._redis.sendCommand.bind(instance._redis);
+    instance._redis.sendCommand = async args => {
+      if (args[0] === 'ZRANGEBYSCORE') {
+        throw new Error('simulated Redis error');
+      }
+      return originalSendCommand(args);
     };
 
     try {
@@ -284,7 +306,7 @@ describe('editorDataRedis presence', () => {
       // replica.
       expect(hvals.presenceUnknown).toBe(true);
     } finally {
-      instance._redis.zrangebyscore = originalZrangebyscore;
+      instance._redis.sendCommand = originalSendCommand;
       await instance.close();
     }
   });
@@ -323,18 +345,21 @@ describe('editorDataRedis presence', () => {
     const docId = 'doc-write-failopen';
     const originalWrite = instance._redis.presenceWriteScript.bind(instance._redis);
     const originalRemove = instance._redis.presenceRemoveScript.bind(instance._redis);
-    const originalDel = instance._redis.del.bind(instance._redis);
     instance._redis.presenceWriteScript = async () => {
       throw new Error('simulated Redis error');
     };
     instance._redis.presenceRemoveScript = async () => {
       throw new Error('simulated Redis error');
     };
-    // removePresenceDocument's happy path calls redis.del directly, not
+    // removePresenceDocument's happy path sends DEL directly, not
     // either script above - that has to fail too for its fail-open branch
     // to actually be exercised.
-    instance._redis.del = async () => {
-      throw new Error('simulated Redis error');
+    const originalSendCommand = instance._redis.sendCommand.bind(instance._redis);
+    instance._redis.sendCommand = async args => {
+      if (args[0] === 'DEL') {
+        throw new Error('simulated Redis error');
+      }
+      return originalSendCommand(args);
     };
 
     // Fail-open means delegating to the memory backend, not just "didn't
@@ -357,7 +382,7 @@ describe('editorDataRedis presence', () => {
     } finally {
       instance._redis.presenceWriteScript = originalWrite;
       instance._redis.presenceRemoveScript = originalRemove;
-      instance._redis.del = originalDel;
+      instance._redis.sendCommand = originalSendCommand;
       memoryAdd.mockRestore();
       memoryRemove.mockRestore();
       memoryRemoveDoc.mockRestore();
@@ -414,7 +439,7 @@ describe('editorDataRedis presence', () => {
       // Confirm the write genuinely landed in Redis via a raw read, not
       // getPresence - getPresence would itself fail open if this were
       // broken in a different way, which would mask the real assertion.
-      const raw = new Redis({host, port});
+      const raw = await createRawRedis({host, port});
       const hashKey = buildKey('presence-test:presence:', ctx.tenant, docId);
       const stored = await raw.hget(hashKey, connId);
       await raw.quit();

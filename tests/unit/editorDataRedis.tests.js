@@ -3,8 +3,15 @@ const path = require('path');
 // Only installed under DocService/node_modules, not at this level - same
 // explicit-path convention tests/integration uses for Common-only packages.
 const {RedisMemoryServer} = require('../../DocService/node_modules/redis-memory-server');
-const Redis = require('../../DocService/node_modules/ioredis');
+const redis = require('../../DocService/node_modules/redis');
 const {buildKey} = require('../../DocService/sources/editorDataRedisKeys');
+
+async function createRawRedis(options) {
+  const client = redis.createClient({socket: options});
+  await client.connect();
+  client.pttl = key => client.pTTL(key);
+  return client;
+}
 
 // Runs against a real Redis via redis-memory-server (in-memory, no manual
 // container) so this is a true unit test, not an integration test needing infra.
@@ -17,9 +24,14 @@ describe('editorDataRedis', () => {
   const ctx = {tenant: 'default'};
 
   beforeAll(async () => {
-    redisServer = new RedisMemoryServer();
-    host = await redisServer.getHost();
-    port = await redisServer.getPort();
+    if (process.env.TEST_REDIS_HOST) {
+      host = process.env.TEST_REDIS_HOST;
+      port = Number(process.env.TEST_REDIS_PORT || 6379);
+    } else {
+      redisServer = new RedisMemoryServer();
+      host = await redisServer.getHost();
+      port = await redisServer.getPort();
+    }
 
     // config's env override must be set before the first require of any
     // module that itself requires('config') - config caches its parsed
@@ -39,7 +51,9 @@ describe('editorDataRedis', () => {
   }, 30000);
 
   afterAll(async () => {
-    await redisServer.stop();
+    if (redisServer) {
+      await redisServer.stop();
+    }
   });
 
   // Two independent in-process EditorData instances model "replica A" and
@@ -90,7 +104,7 @@ describe('editorDataRedis', () => {
       // margin on a loaded CI runner, short enough to keep the test fast;
       // correctness doesn't depend on the real 60s value.
       const ttlSeconds = 2;
-      const raw = new Redis({host, port});
+      const raw = await createRawRedis({host, port});
 
       try {
         const first = await replicaA.lockSave(ctx, docId, 'uid-1', ttlSeconds);
@@ -129,7 +143,7 @@ describe('editorDataRedis', () => {
     test('key-collision avoidance via encodeURIComponent for (tenant, docId) pairs that collide when naively joined', async () => {
       const replicaA = new editorDataRedis.EditorData();
       await replicaA.connect();
-      const raw = new Redis({host, port});
+      const raw = await createRawRedis({host, port});
 
       try {
         // "a:b" + ":" + "c"  ===  "a" + ":" + "b:c"  ===  "a:b:c" if naively joined.
@@ -190,7 +204,7 @@ describe('editorDataRedis', () => {
 
     // Fail-closed on a Redis error, simulated deterministically by making
     // the underlying script call throw, rather than racing a real broken
-    // connection against ioredis's async retry/timeout machinery.
+    // connection against Redis's async retry/timeout machinery.
     test('lockSave/lockAuth deny (not throw) and unlockSave reports LOCKED on a Redis error', async () => {
       const replica = new editorDataRedis.EditorData();
       await replica.connect();
@@ -226,7 +240,7 @@ describe('editorDataRedis', () => {
       const replica = new editorDataRedis.EditorData();
       await replica.connect();
       try {
-        expect(replica._redis.options.commandTimeout).toBe(300);
+        expect(replica._redis.__editorDataCommandTimeout).toBe(300);
       } finally {
         await replica.close();
       }
@@ -260,23 +274,24 @@ describe('editorDataRedis', () => {
       const replica = new editorDataRedis.EditorData();
       await replica.connect();
       const docId = 'doc-cleanup-fail';
-      const originalDel = replica._redis.del.bind(replica._redis);
-      replica._redis.del = async () => {
-        throw new Error('simulated Redis error');
+      const originalSendCommand = replica._redis.sendCommand.bind(replica._redis);
+      replica._redis.sendCommand = async args => {
+        if (args[0] === 'DEL') {
+          throw new Error('simulated Redis error');
+        }
+        return originalSendCommand(args);
       };
 
       try {
         await expect(replica.cleanDocumentOnExit(ctx, docId)).resolves.toBeUndefined();
       } finally {
-        replica._redis.del = originalDel;
+        replica._redis.sendCommand = originalSendCommand;
         await replica.close();
       }
     });
 
     // Regression for isConnected()/healthCheck() being unable to ever turn
-    // true on an idle replica under the shipped iooptions.lazyConnect:
-    // true default, since nothing but real lock/presence traffic used to
-    // touch _redis at all.
+    // true on an idle replica when no Redis command has touched the client.
     test('isConnected()/healthCheck() become true after connect(), with no lock/presence traffic', async () => {
       const replica = new editorDataRedis.EditorData();
       await replica.connect();
@@ -295,14 +310,25 @@ describe('editorDataRedis', () => {
         await replica.close();
       }
     }, 10000);
+
+    test('ping reconnects a client after it has been closed', async () => {
+      const replica = new editorDataRedis.EditorData();
+      await replica.connect();
+      await replica.close();
+
+      expect(replica.isConnected()).toBe(false);
+      await expect(replica.ping()).resolves.toBe('PONG');
+      expect(replica.isConnected()).toBe(true);
+      await replica.close();
+    });
   });
 
-  // ioredis emits connection failures as 'error' events, not as command
+  // Redis emits connection failures as 'error' events, not as command
   // rejections, so they never reach the stores' catch blocks. With no
-  // listener it prints "[ioredis] Unhandled error event" and a stack to
+  // listener it prints an unhandled error and a stack to
   // stderr once per retry - unthrottled, and outside the logger.
   describe('connection errors', () => {
-    test('are listened for, so ioredis does not print them itself', async () => {
+    test('are listened for, so Redis does not print them itself', async () => {
       const instance = new editorDataRedis.EditorData();
       try {
         expect(instance._redis.listenerCount('error')).toBeGreaterThan(0);

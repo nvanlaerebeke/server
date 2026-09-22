@@ -99,24 +99,20 @@ surface.
 
 | Deployment                   | Minimum    | What sets the floor                                            |
 | ---------------------------- | ---------- | -------------------------------------------------------------- |
-| Standalone / sentinel        | **2.6.12** | `EVALSHA` and `PEXPIRE` (2.6.0), `SET … PX` (2.6.12)           |
+| Standalone / sentinel        | **2.6.12** | `EVAL`, `PEXPIRE` (2.6.0), `SET … PX` (2.6.12)                |
 | Cluster                      | **3.0**    | Cluster mode and hash-tag slot routing did not exist before it |
 | Any deployment naming a user | **6.0**    | Two-argument `AUTH`, i.e. ACLs — see below                     |
 
 The command set is `SET … PX`, `GET`, `DEL`, `HSET`, `HGET`, `HDEL`,
 `HMGET`, `ZADD`, `ZSCORE`, `ZREM`, `ZRANGEBYSCORE … LIMIT`, `PEXPIRE`,
-`PING`, plus `EVAL`/`EVALSHA` for the Lua scripts — ioredis sends `EVAL`
-once per socket and `EVALSHA` thereafter. None of those set a floor above
+`PING`, plus `EVAL` for the Lua scripts. None of those set a floor above
 2.6.12.
 
-**Naming a Redis user raises the floor to 6.0.** ioredis builds its `AUTH`
-from `username ? [username, password] : password`, so a username being
-present at all — not a password — is what makes it send the two-argument
-form, and two-argument `AUTH` is Redis 6.0 and later. On Redis 5 or below
-the server answers "wrong number of arguments"; ioredis logs a warning and
-carries on unauthenticated. If the server needs no password that is
-harmless. If it does, every subsequent command fails `NOAUTH`, and with
-fail-closed locks that is a total save outage.
+**Naming a Redis user raises the floor to 6.0.** node-redis sends the
+two-argument `AUTH` form when `username` is configured, and two-argument
+`AUTH` is Redis 6.0 and later. On Redis 5 or below the server rejects that
+form; with fail-closed locks, a password-protected deployment then refuses
+every save until its Redis version or configuration is corrected.
 
 The orchestrated entrypoint used to emit `username: "default"`
 unconditionally, which imposed 6.0 on every deployment. It now emits one
@@ -153,7 +149,7 @@ Valkey in cluster mode across six nodes; standalone-only would exclude it,
 and with it the only external evidence the module works.
 
 **It cannot be deferred, because it is a key-format decision.** Cluster
-support is a hash tag in `buildKey` plus constructing `Redis.Cluster`.
+support is a hash tag in `buildKey` plus constructing `redis.createCluster`.
 Adding it later changes the key format at that point, which means a rolling
 upgrade where two cohorts do not share a lock — transiently reintroducing
 the exact defect this module fixes. A brace pair now; a migration later.
@@ -169,20 +165,19 @@ written in response to.
 
 | `mode`           | Client                                                                                                                                                              |
 | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `auto` (default) | Cluster when cluster nodes are configured (`optionsCluster.rootNodes` or `iooptionsClusterNodes`); sentinel when a credible sentinel list is; standalone otherwise. |
-| `standalone`     | `new Redis({host, port, ...iooptions})`, with sentinel-only options stripped.                                                                                       |
-| `sentinel`       | Sentinel mode, honouring `iooptions.sentinels`. Errors if that array is empty.                                                                                      |
-| `cluster`        | `Redis.Cluster` over `optionsCluster.rootNodes` or `iooptionsClusterNodes`. Errors if both are empty.                                                               |
+| `auto` (default) | Cluster when `optionsCluster.rootNodes` is configured; sentinel when a credible sentinel list is; standalone otherwise. |
+| `standalone`     | `redis.createClient({socket: {host, port}, ...options})`, with sentinel-only options stripped. |
+| `sentinel`       | `redis.createSentinel(...)`, honouring `options.sentinels`. Errors if that array is empty. |
+| `cluster`        | `redis.createCluster(...)` over `optionsCluster.rootNodes`. Errors if the list is empty. |
 
 Anything else throws at startup and names the valid set. That is
 deliberate: a mode that fell through to standalone turned a typo into
 connection-refused against `localhost`, which sends an operator looking at
 Redis rather than at their own configuration.
 
-**Why `auto` does not simply trust `iooptions.sentinels`.** The image's
-entrypoint emits that key unconditionally, and when no sentinel is
-configured it falls back to listing the plain Redis server as its own
-sentinel. Spreading that into `new Redis()` puts ioredis into sentinel mode
+**Why `auto` does not simply trust `options.sentinels`.** Older image
+entrypoints could emit a fabricated sentinel containing the standalone
+server itself. Treating that as a real sentinel would select sentinel mode
 on every non-sentinel deployment, where it never connects — and because the
 locks fail closed, every save is refused while the deployment looks healthy.
 
@@ -224,7 +219,9 @@ running a build containing it.
 | File                             | Responsibility                                                                                                                                                                                              |
 | -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `editorDataRedis.js`             | Composition root: owns the Redis connection and the `editorDataMemory` delegate, wires the two stores below against them, exposes the same `EditorData` interface the rest of the codebase already expects. |
-| `editorDataRedisClient.js`       | Builds the ioredis client for the deployment's topology — standalone, sentinel or cluster — per `services.CoAuthoring.redis.mode`.                                                                          |
+| `editorDataRedisClient.js`       | Builds the node-redis client for the deployment's topology — standalone, sentinel or cluster — per `services.CoAuthoring.redis.mode`.                                                                          |
+| `editorDataRedisData.js`         | Redis-backed object locks, messages, saved state, force-save state and timers.                                                                                                                                |
+| `editorDataRedisStat.js`         | Redis-backed unique-user, connection, shard, shutdown, licence and notification statistics.                                                                                                                   |
 | `editorDataRedisSaveLock.js`     | `lockSave`/`unlockSave`/`lockAuth`/`unlockAuth`, as atomic Lua scripts.                                                                                                                                     |
 | `editorDataRedisReport.js`       | Throttled failure reporting shared by the stores, so a degraded backend is visible without flooding the log.                                                                                                |
 | `editorDataRedisPresence.js`     | `addPresence`/`updatePresence`/`removePresence`/`getPresence`/`getDocumentPresenceExpired`/`removePresenceDocument`.                                                                                        |
@@ -245,26 +242,17 @@ the cost of being wrong differs:
   that document indefinitely — fail-closed only works if the failure
   itself arrives quickly.
 
-  On a cluster that timeout is not enough on its own. ioredis applies
-  `commandTimeout` in the **node** client, and `Redis.Cluster` only reaches
-  a node once it reports ready; until then it parks commands on its own
-  queue, which has no timer, while the default retry strategy retries
-  forever. So an unreachable cluster would hang every save and auth rather
-  than deny them — and with nothing rejecting, nothing to report either.
-  `enableOfflineQueue: false` on the Cluster is what makes it reject
-  immediately while it is not ready.
+  On a cluster the timeout is passed to node-redis for the routed command,
+  and the client also has `disableOfflineQueue: true`. An unreachable node
+  therefore rejects or aborts the command instead of retaining it for a
+  later reconnect, so the caller receives a denial rather than a delayed
+  lock result.
 
-  **A denial has to stay denied, which takes a second option.** The timeout
-  settles the promise the caller awaits, but ioredis keeps the command
-  object and re-sends it on reconnect without checking whether that promise
-  already settled. Two queues do this: the offline queue, for commands never
-  written, and the unfulfilled queue, for commands written whose reply never
-  arrived — the latter default-**on** as `autoResendUnfulfilledCommands`, and
-  reachable by nothing more exotic than a socket drop mid-command. Either one
-  turns a lock the caller was told it did not get into a lock it holds and
-  will never release, for the whole lock TTL, indistinguishable from a real
-  one. Both are disabled, on every topology, and applied after the
-  operator's options so `iooptions` cannot put them back.
+  **A denial has to stay denied.** node-redis' command timeout uses an abort
+  signal for the queued command, while `disableOfflineQueue` prevents a
+  command issued before readiness from being retained. Both protections are
+  applied after the operator's options so a deployment cannot accidentally
+  re-enable the replay path for lock operations.
 
 - **Presence fails open.** A Redis error falls back to the memory
   backend's local-connections-only view instead of throwing. The failure
@@ -366,20 +354,11 @@ level — the line worth alerting on — then stays quiet apart from a
 once-a-minute reminder carrying the suppressed count, and logs recovery at
 `info`.
 
-Connection failures are reported through the same throttle. ioredis emits
-those as `'error'` events rather than as command rejections, so they never
-reach the stores' catch blocks — and with no listener attached it prints
-`[ioredis] Unhandled error event` and a stack straight to stderr, once per
-retry, for the length of an outage. The composition root listens and routes
-them here, and on a cluster also listens for `'node error'`, which is where
-a single unreachable master arrives; cluster-level `'error'` fires only once
-every node has failed.
-
-Two connection-level failures still bypass this: ioredis reports an
-`AUTH` argument-count mismatch and a failed `SELECT` with its own
-`console.warn`, once per connect attempt, and carries on. Their consequences
-surface as command failures through the store reporters, but the cause does
-not.
+Connection failures are reported through the same throttle. node-redis emits
+those as `'error'` and `'reconnecting'` events rather than as ordinary
+command rejections, so the composition root listens and routes them here.
+The client applies the same error handling to standalone, sentinel and
+cluster connections.
 
 **One reporter per concern, not per store.** A reporter that sees an
 interleaved failure and success re-arms its own throttle every time. That
@@ -426,23 +405,26 @@ above.
 ## Testing
 
 `tests/unit/editorDataRedis.tests.js`, `editorDataRedisPresence.tests.js`,
+`editorDataRedisData.tests.js`, `editorDataRedisStat.tests.js`,
 `editorDataRedisReport.tests.js` and `editorDataRedisKeys.tests.js` cover
-the modules above against a real
+the Redis-backed implementation against a real
 Redis via `redis-memory-server` (an in-memory Redis, no container needed —
 portable to CI). Covered: cross-replica lock/presence discrimination
 against isolated instances, reentrancy and TTL expiry, key-collision
 avoidance, unlock/lockAuth outcomes, HASH/ZSET write atomicity, the sharded
-sweep, fail-closed and fail-open behavior on a simulated Redis error
-(verified via the actual fallback call, not just "didn't throw"), and
+sweep, fail-closed and fail-open behavior on a simulated Redis error,
+object locks, messages, saved state, force-save state, timers, unique-user
+statistics, connection samples, shard counts, notifications, shutdown and
+licence state. The suite also checks tenant isolation and
 `cleanDocumentOnExit` correctly leaving a still-connected viewer's presence
 entry untouched.
 
 `editorDataRedisClient.tests.js` covers topology selection — that an
 entrypoint-fabricated `sentinels` array is ignored rather than acted on,
 that an unrecognised mode is refused rather than silently downgraded, that
-both spellings of the cluster node list are honoured, that neither replay
-queue can be re-enabled from operator config on any topology, and that
-cluster `lazyConnect` and credentials land where ioredis reads them.
+cluster root nodes are normalized, that offline queuing cannot be re-enabled
+from operator config, and that cluster credentials land in node-redis' shared
+defaults.
 
 **Independently measured.** A production deployment (2 and 4 docservice
 replicas on Kubernetes, Valkey standalone and in 6-node cluster mode)
@@ -473,8 +455,9 @@ into a committed, CI-runnable integration test is still open.
 
 - Owner-token locks are not fencing tokens (see above) — open, not
   evaluated against the write path.
-- Block locks, messages, save-state, force-save, and telemetry are still
-  entirely `editorDataMemory`-backed and therefore still single-replica-only.
+- The Redis-backed data and statistics paths are covered at the interface
+  level; document-server end-to-end flows still need a real multi-process
+  integration test.
 - No committed multi-replica integration test exists; the cross-replica
   claim above has only been verified manually.
 - One question from manual testing was never resolved either way: whether
@@ -522,22 +505,10 @@ into a committed, CI-runnable integration test is still open.
 - `EditorData.close()` has no production caller — nothing invokes it on
   shutdown, so the process relies on the OS tearing the socket down. Its
   `quit()`-then-`disconnect()` fallback is exercised only by the test suite.
-- **Two replay paths remain open on a cluster, and cannot be closed from
-  here.** ioredis builds each per-node client with `enableOfflineQueue: true`
-  hardcoded ahead of anything we pass, so a command routed to a node that is
-  still connecting can outlive its timeout and be re-sent on node ready.
-  Separately, a `MOVED`/`ASK` reply arriving after the timeout is retried
-  against the new node. Both produce the same phantom lock as the queues
-  above; the bound is the lock's own TTL and its owner-checked release. A
-  compensating unlock on timeout would close the first — it would queue
-  behind the lock on the same node and replay in order — but it changes the
-  lock's semantics on a denied refresh, so it is a deliberate decision rather
-  than an oversight.
-- **Cluster support is untested by us.** `Redis.Cluster` construction,
-  `MOVED` following and cross-node script routing ship verified only by
-  unit tests over the client-selection logic and the slot arithmetic; no
-  cluster was available here. Measuring a real cluster against a built
-  artefact is the verification this needs.
+- **Cluster support still needs a real-cluster CI run.** The client-selection
+  tests cover construction and slot routing setup, but a Redis Cluster job
+  should exercise `MOVED` following and cross-node script routing before this
+  feature is considered production-ready.
 - `getEditorsCount` returning "editors present" on an unreliable read means
   that when the last editor of a document disconnects during a Redis outage,
   `closeDocument` takes the `sendStatusDocument` branch instead of
