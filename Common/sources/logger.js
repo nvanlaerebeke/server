@@ -31,6 +31,7 @@ const fs = require('fs');
 
 const log4js = require('log4js');
 const layouts = require('log4js/lib/layouts');
+const reporters = require('./reporters');
 const logConfigPath = config.get('log.filePath');
 const logOptions = config.get('log.options');
 
@@ -58,7 +59,7 @@ log4js.addLayout('json', () => {
 });
 
 /**
- * Custom pattern layout that supports %x{usid} using USERSESSIONID from context.
+ * Custom pattern layout that supports %x{usid} using USERSESSIONID and %x{ref} using REFERENCEDATA from context.
  * @param {object} cfg
  * @returns {function}
  */
@@ -69,6 +70,10 @@ log4js.addLayout('patternWithTokens', cfg => {
     usid(ev) {
       const id = ev && ev.context && ev.context.USERSESSIONID;
       return id ? ` [${id}]` : '';
+    },
+    ref(ev) {
+      const referenceData = ev?.context?.REFERENCEDATA;
+      return referenceData ? ` [${Object.values(referenceData).join('/')}]` : '';
     }
   });
   return layouts.patternLayout(pattern, tokens);
@@ -77,9 +82,22 @@ log4js.addLayout('patternWithTokens', cfg => {
 const cachedLogConfig = JSON.parse(fs.readFileSync(logConfigPath, 'utf8'));
 let curLogConfig = cachedLogConfig;
 
+function withReporterAppenders(logConfig) {
+  const reporterAppenders = reporters.appenders();
+  const names = Object.keys(reporterAppenders);
+  if (names.length === 0) {
+    return logConfig;
+  }
+  const categories = {};
+  for (const [name, category] of Object.entries(logConfig.categories)) {
+    categories[name] = {...category, appenders: [...category.appenders, ...names]};
+  }
+  return {...logConfig, appenders: {...logConfig.appenders, ...reporterAppenders}, categories};
+}
+
 function configureLogger(options) {
   const mergedOptions = config.util.extendDeep({}, cachedLogConfig, options);
-  log4js.configure(mergedOptions);
+  log4js.configure(withReporterAppenders(mergedOptions));
   curLogConfig = mergedOptions;
 }
 configureLogger(logOptions);
