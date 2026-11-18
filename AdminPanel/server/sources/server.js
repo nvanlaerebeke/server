@@ -25,8 +25,10 @@
 
 'use strict';
 
+require('../../../Common/sources/reporters').init('adminpanel');
 const moduleReloader = require('../../../Common/sources/moduleReloader');
 const config = moduleReloader.requireConfigWithRuntime();
+const logger = require('../../../Common/sources/logger');
 const operationContext = require('../../../Common/sources/operationContext');
 const tenantManager = require('../../../Common/sources/tenantManager');
 const license = require('../../../Common/sources/license');
@@ -70,7 +72,7 @@ const updateLicense = async () => {
     tenantManager.setDefLicense(licenseInfo, licenseOriginal);
     operationContext.global.logger.info('End updateLicense');
   } catch (err) {
-    operationContext.global.logger.error('updateLicense error: %s', err.stack);
+    operationContext.global.logger.error('updateLicense error:', err);
   }
 };
 
@@ -101,7 +103,7 @@ setInterval(updateLicense, 86400000);
       }
     }
   } catch (e) {
-    operationContext.global.logger.error('Bootstrap token generation error: %s', e.stack);
+    operationContext.global.logger.error('Bootstrap token generation error:', e);
   }
 })();
 
@@ -174,8 +176,15 @@ if (process.env.NODE_ENV.startsWith('development-')) {
 app.use((err, req, res, _next) => {
   const ctx = new operationContext.Context();
   ctx.initFromRequest(req);
-  ctx.logger.error('default error handler:%s', err.stack);
+  ctx.logger.error('default error handler:', err);
   res.sendStatus(err.status || err.statusCode || 500);
+});
+
+process.on('uncaughtException', err => {
+  operationContext.global.logger.error('uncaughtException:', err);
+  logger.shutdown(() => {
+    process.exit(1);
+  });
 });
 
 server.listen(port, () => {
@@ -184,7 +193,7 @@ server.listen(port, () => {
 
 //Initialize watch here to avoid circular import with operationContext
 runtimeConfigManager.initRuntimeConfigWatcher(operationContext.global).catch(err => {
-  operationContext.global.logger.warn('initRuntimeConfigWatcher error: %s', err.stack);
+  operationContext.global.logger.warn('initRuntimeConfigWatcher error:', err);
 });
 //after all required modules in all files
 moduleReloader.finalizeConfigWithRuntime();
